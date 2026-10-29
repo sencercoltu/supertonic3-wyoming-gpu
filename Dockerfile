@@ -38,6 +38,11 @@ RUN python3 -c "from supertonic import TTS; TTS(model='supertonic-3', auto_downl
 # counts. One-line diff from upstream, see git history.
 # Note: upstream's run() script passes --zeroconf; we skip it because mDNS
 # across docker bridge networks is unreliable - add the integration manually by IP:port.
+# Image version stamp: CI passes the git sha; gpu_entry.py logs it at every
+# container start so you can always tell which build is actually running.
+ARG BUILD_VERSION=dev
+ENV SUPERTONIC_BUILD_VERSION=${BUILD_VERSION}
+
 COPY supertonic_server.py /opt/supertonic_server.py
 COPY describe_probe.py /opt/describe_probe.py
 COPY gpu_entry.py /opt/gpu_entry.py

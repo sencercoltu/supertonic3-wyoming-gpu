@@ -29,6 +29,8 @@ jobs:
           push: true
           platforms: linux/amd64          # CUDA wheels: amd64 only
           provenance: false               # plain image manifest -> best pull compatibility
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.sha }}

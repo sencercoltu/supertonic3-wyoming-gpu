@@ -27,6 +27,26 @@ DEFAULT_ARGS = [
 def main() -> None:
     want_gpu = os.environ.get("SUPERTONIC_GPU", "1").lower() not in ("0", "false", "off", "")
 
+    # Identity line: which build is this, and which protocol/inference libs
+    # did CI bake in? First line of every container start.
+    import importlib.metadata as md
+
+    def _ver(pkg: str) -> str:
+        try:
+            return md.version(pkg)
+        except Exception:
+            return "?"
+
+    print(
+        "[gpu-entry] build %s | wyoming %s | supertonic %s"
+        % (
+            os.environ.get("SUPERTONIC_BUILD_VERSION", "dev"),
+            _ver("wyoming"),
+            _ver("supertonic"),
+        ),
+        flush=True,
+    )
+
     import onnxruntime as ort
     available = ort.get_available_providers()
     print(f"[gpu-entry] onnxruntime {ort.__version__}, available providers: {available}", flush=True)
