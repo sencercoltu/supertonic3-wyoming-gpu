@@ -1,0 +1,22 @@
+version: "3.9"
+services:
+  # Supertonic-3 (Text-to-Speech, 31 languages) - GPU Accelerated, Wyoming on 10300
+  supertonic:
+    container_name: supertonic
+    image: ghcr.io/YOUR_GITHUB_USERNAME/supertonic3-wyoming-gpu:latest
+    build: ./supertonic3-wyoming-gpu        # optional local fallback; remove once pulling from GHCR
+    network_mode: bridge
+    ports:
+      - "10301:10300"                       # 10300 is already taken by your whisper on this host
+    environment:
+      - SUPERTONIC_GPU=1                    # 0 = force CPU (for A/B benchmarking)
+    volumes:
+      - ./supertonic3-wyoming-gpu/options.json:/data/options.json:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
