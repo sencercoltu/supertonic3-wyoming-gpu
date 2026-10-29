@@ -10,8 +10,10 @@ Runs the Wyoming TTS server from [JulienDeveaux/HA-Supertonic-Addon](https://git
   — hardcoded to `["CPUExecutionProvider"]` upstream, but read at call time, so it can be
   overridden at process start (`gpu_entry.py`). No sed hacks, no forked server code.
 - The image swaps `onnxruntime` → `onnxruntime-gpu` (CUDA EP), on a CUDA 12.6 + cuDNN 9 base.
-- The server code is `ADD`ed straight from the add-on repo, so it can diverge from an
-  installed add-on version — it's the same file, unmodified.
+- The Wyoming server is **vendored** into this repo as `supertonic_server.py` (from
+  `JulienDeveaux/HA-Supertonic-Addon` @ `1b5d612a`, 2026-05-14). One local diff: a startup
+  log line reporting how many voices/languages it advertises. Builds are reproducible now —
+  no silent drift from an upstream `main` push.
 - Voices/config come from `/data/options.json` (the add-on Supervisor normally writes this;
   here we just mount it).
 
@@ -85,6 +87,24 @@ faster one; keeping `CPUExecutionProvider` as fallback means unsupported ops aut
 3. **310 voices** = `<lang>_<voice>` (`en_F2`, `tr_M4`, …), pick a default in the entity
    options, or per call:
 
+HA derives the assistant's TTS **Language** dropdown from the union of the `languages`
+field on every advertised voice. If it shows only one language (or Dev tools → States →
+`tts.supertonic3` shows `supported_languages: ['en']`), run the probe against the running
+container to see what the server really put on the wire:
+
+```
+docker exec supertonic3 python3 /opt/describe_probe.py
+# program : supertonic3 v3.0.0
+# voices  : 310
+# langs   : 31 -> ar, bg, cs, ... tr, uk, vi
+```
+
+- `langs : 31` but HA still lists one → the HA side dropped them (known voice-preset
+  option-flow quirk; check for a Home Assistant core update, and use the entity Options
+  or `options.voice` per call in the meantime — both work regardless).
+- `langs : 1` or a `WARNING: voices carry NO languages field` → the server/image is at
+  fault; the probe's `sample` JSON shows the exact serialized fields to fix.
+
 ```yaml
 action: tts.speak
 target:
@@ -106,7 +126,7 @@ data:
 | `volume_boost` | linear gain (clipped) | 1.0–3.0 (server default 2.0 is loud) |
 | `quality` | diffusion steps → voice quality vs speed | 2–16 |
 
-Changes need `docker restart supertonic` (file is read at startup).
+Changes need `docker restart supertonic3` (file is read at startup).
 
 ## Notes & caveats
 
@@ -119,5 +139,6 @@ Changes need `docker restart supertonic` (file is read at startup).
   with a 500 ms tail pad), so long announcements start playing early.
 - Supertonic-3 weights are OpenRAIL-M (commercial use OK with use restrictions); the
   server wrapper is from the add-on repo — keep both when redistributing.
-- If a future add-on/server update changes `supertonic_server.py` arguments, the Dockerfile
-  `ADD` URL is where to bump/re-pin (branch → tag/commit for determinism).
+- To pick up upstream server fixes later: re-copy `supertonic_server.py` from
+  `JulienDeveaux/HA-Supertonic-Addon` (`supertonic_tts/rootfs/usr/bin/`), re-apply the
+  one-line advertise log, and note the upstream commit here.

@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+"""
+Supertonic3 TTS Wyoming Server for Home Assistant
+Provides text-to-speech via Wyoming protocol for automatic discovery
+"""
+
+import argparse
+import asyncio
+import logging
+import re
+import sys
+from functools import partial
+from pathlib import Path
+
+import numpy as np
+from wyoming.audio import AudioChunk, AudioStop
+from wyoming.event import Event
+from wyoming.info import Attribution, Describe, Info, TtsProgram, TtsVoice
+from wyoming.server import AsyncServer, AsyncEventHandler
+from wyoming.tts import Synthesize
+
+from supertonic import TTS
+
+
+# Abbreviation expansion maps — longest keys first to avoid partial matches
+# Each entry: (abbrev_with_dot, case_sensitive) → full word
+# Sorted by length descending at build time so "Mme." is replaced before "M."
+_ABBREV_EXPAND_FR = {
+    "Mlle.": "Mademoiselle",
+    "Mgr.":  "Monseigneur",
+    "Mme.":  "Madame",
+    "Pr.":   "Professeur",
+    "Me.":   "Maître",
+    "Ste.":  "Sainte",
+    "St.":   "Saint",
+    "Dr.":   "Docteur",
+    "M.":    "Monsieur",
+    "vol.":  "volume",
+    "art.":  "article",
+    "fig.":  "figure",
+    "env.":  "environ",
+    "hab.":  "habitants",
+    "cf.":   "voir",
+    "vs.":   "versus",
+    "etc.":  "et cetera",
+    "p.":    "page",
+}
+
+_ABBREV_EXPAND_EN = {
+    "Prof.":   "Professor",
+    "Dept.":   "Department",
+    "Blvd.":   "Boulevard",
+    "approx.": "approximately",
+    "Mrs.":    "Missus",
+    "Ave.":    "Avenue",
+    "Fig.":    "Figure",
+    "Mr.":     "Mister",
+    "Ms.":     "Miss",
+    "Dr.":     "Doctor",
+    "Sr.":     "Senior",
+    "Jr.":     "Junior",
+    "St.":     "Saint",
+    "vs.":     "versus",
+    "etc.":    "et cetera",
+    "no.":     "number",
+}
+
+_ABBREV_EXPAND_BY_LANG = {
+    "fr": _ABBREV_EXPAND_FR,
+    "en": _ABBREV_EXPAND_EN,
+}
+
+# Pre-compile one regex per language (word boundary + abbreviation + dot, case-insensitive)
+def _build_abbrev_re(expand_map: dict):
+    keys = sorted(expand_map.keys(), key=len, reverse=True)
+    pattern = '|'.join(r'\b' + re.escape(k) for k in keys)
+    return re.compile(pattern, re.IGNORECASE)
+
+_ABBREV_RE_BY_LANG = {
+    lang: _build_abbrev_re(expand_map)
+    for lang, expand_map in _ABBREV_EXPAND_BY_LANG.items()
+}
+
+# Lowercase lookup dicts — used in _replace to resolve matches case-insensitively
+_ABBREV_LOWER_BY_LANG = {
+    lang: {k.lower(): v for k, v in expand_map.items()}
+    for lang, expand_map in _ABBREV_EXPAND_BY_LANG.items()
+}
+
+
+def expand_abbreviations(text: str, language: str) -> str:
+    """Replace abbreviations with their full spoken form for a given language.
+
+    e.g. (FR) "M. Dupont est Dr. en médecine." → "Monsieur Dupont est Docteur en médecine."
+         (EN) "Dr. Smith works on Ave. 5."     → "Doctor Smith works on Avenue 5."
+    """
+    expand_map = _ABBREV_EXPAND_BY_LANG.get(language)
+    abbrev_re  = _ABBREV_RE_BY_LANG.get(language)
+    if expand_map is None or abbrev_re is None:
+        return text
+
+    lower_map = _ABBREV_LOWER_BY_LANG[language]
+
+    def _replace(m: re.Match) -> str:
+        matched = m.group(0)
+        expansion = lower_map.get(matched.lower(), matched)
+        # Preserve capitalisation: if original starts with uppercase, capitalise expansion
+        if matched[0].isupper():
+            return expansion[0].upper() + expansion[1:]
+        return expansion
+
+    return abbrev_re.sub(_replace, text)
+
+
+def split_into_sentences(text: str, language: str = "fr", max_len: int = 250) -> list:
+    """Expand abbreviations then split on sentence boundaries, each chunk under max_len chars."""
+    # Expand abbreviations so periods inside them no longer trigger splits
+    expanded = expand_abbreviations(text.strip(), language)
+
+    # Split on sentence-ending punctuation followed by whitespace
+    raw = re.split(r'(?<=[.!?;])\s+', expanded)
+
+    result = []
+    for sentence in raw:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        # If still too long, split on commas
+        if len(sentence) > max_len:
+            sub_parts = re.split(r'(?<=,)\s+', sentence)
+            current = ""
+            for part in sub_parts:
+                if len(current) + len(part) + 1 <= max_len:
+                    current = (current + " " + part).strip() if current else part
+                else:
+                    if current:
+                        result.append(current)
+                    current = part
+            if current:
+                result.append(current)
+        else:
+            result.append(sentence)
+
+    return result if result else [expanded] if expanded else []
+
+# Configure logging
+_LOGGER = logging.getLogger(__name__)
+
+# Available languages and voices.
+# Supertonic-3 supports 31 ISO codes plus the SDK's "na" UNKNOWN_LANGUAGE fallback.
+# 'na' is accepted as default_language for unknown text but is not advertised as
+# a Wyoming voice (310 voices is already large enough for HA's UI).
+SUPPORTED_LANGUAGES = {
+    "en": "English",
+    "fr": "French",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "ko": "Korean",
+    "ja": "Japanese",
+    "ar": "Arabic",
+    "bg": "Bulgarian",
+    "cs": "Czech",
+    "da": "Danish",
+    "de": "German",
+    "el": "Greek",
+    "et": "Estonian",
+    "fi": "Finnish",
+    "hi": "Hindi",
+    "hr": "Croatian",
+    "hu": "Hungarian",
+    "id": "Indonesian",
+    "it": "Italian",
+    "lt": "Lithuanian",
+    "lv": "Latvian",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "ro": "Romanian",
+    "ru": "Russian",
+    "sk": "Slovak",
+    "sl": "Slovenian",
+    "sv": "Swedish",
+    "tr": "Turkish",
+    "uk": "Ukrainian",
+    "vi": "Vietnamese",
+}
+
+SUPPORTED_VOICES = {
+    "M1": "Male Voice 1",
+    "M2": "Male Voice 2",
+    "M3": "Male Voice 3",
+    "M4": "Male Voice 4",
+    "M5": "Male Voice 5",
+    "F1": "Female Voice 1",
+    "F2": "Female Voice 2",
+    "F3": "Female Voice 3",
+    "F4": "Female Voice 4",
+    "F5": "Female Voice 5"
+}
+
+
+class SupertonicEventHandler(AsyncEventHandler):
+    """Handle Wyoming protocol events for Supertonic3 TTS"""
+
+    def __init__(
+        self,
+        wyoming_info: Info,
+        cli_args: argparse.Namespace,
+        tts,
+        voice_styles: dict,
+        config: dict,
+        synth_lock: asyncio.Lock,
+        *args,
+        **kwargs
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.wyoming_info = wyoming_info
+        self.cli_args = cli_args
+        self.tts = tts
+        self.voice_styles = voice_styles
+        self.config = config
+        # ONNX Runtime sessions are not safe to call concurrently from multiple
+        # threads. We serialize synthesize() across handlers with a shared lock.
+        self.synth_lock = synth_lock
+
+    async def handle_event(self, event: Event) -> bool:
+        """Handle a Wyoming protocol event"""
+        _LOGGER.debug("Received event: %s", event.type)
+
+        if Describe.is_type(event.type):
+            # Client is asking for server information
+            _LOGGER.info("Received Describe request, sending Info")
+            await self.write_event(self.wyoming_info.event())
+            return True
+        elif Synthesize.is_type(event.type):
+            # Client wants to synthesize speech
+            synthesize = Synthesize.from_event(event)
+            await self._handle_synthesize(synthesize)
+            return True
+        else:
+            _LOGGER.warning("Unexpected event type: %s", event.type)
+            return True
+
+    async def _handle_synthesize(self, synthesize: Synthesize):
+        """Handle a TTS synthesis request with sentence-level streaming."""
+        text = synthesize.text
+
+        # Get voice name - synthesize.voice is a SynthesizeVoice object
+        if synthesize.voice:
+            voice = synthesize.voice.name
+        else:
+            voice = self.config.get("default_voice", "M4")
+
+        # Extract language from voice spec (e.g., "fr_M4" -> "fr", "M4")
+        if "_" in voice:
+            language, voice_name = voice.split("_", 1)
+        else:
+            # Default language if not specified
+            language = self.config.get("default_language", "fr")
+            voice_name = voice
+
+        # Get parameters
+        speed = self.config.get("speed", 1.5)
+        volume = self.config.get("volume_boost", 2.0)
+        quality = self.config.get("quality", 5)
+
+        # Get voice style
+        if voice_name not in self.voice_styles:
+            _LOGGER.warning("Voice %s not found, using default", voice_name)
+            voice_name = self.config.get("default_voice", "M4")
+
+        style = self.voice_styles[voice_name]
+
+        # Expand abbreviations and split text into sentences for streaming
+        sentences = split_into_sentences(text, language=language)
+        _LOGGER.info("Synthesizing %d sentence(s): text='%s...' lang=%s voice=%s",
+                     len(sentences), text[:50], language, voice_name)
+
+        loop = asyncio.get_running_loop()
+
+        for idx, sentence in enumerate(sentences):
+            if not sentence.strip():
+                continue
+            try:
+                _LOGGER.debug("Synthesizing sentence %d/%d: '%s'", idx + 1, len(sentences), sentence[:60])
+
+                # Workaround for Supertonic-3 Duration Predictor under-allocation:
+                # on some short phrases the model predicts a buffer too small for
+                # the actual speech and clips the last word. Appending extra
+                # periods forces the predictor to allocate ~480ms more room — the
+                # periods are rendered as a brief silent pause, not as audible
+                # sound.
+                padded_text = sentence + "...."
+
+                # Run blocking TTS in thread pool to avoid blocking the event loop.
+                # Lock serializes ONNX Runtime calls across concurrent Wyoming clients.
+                async with self.synth_lock:
+                    wav, duration = await loop.run_in_executor(
+                        None,
+                        lambda s=padded_text: self.tts.synthesize(
+                            text=s,
+                            voice_style=style,
+                            lang=language,
+                            total_steps=int(quality),
+                            speed=float(speed),
+                        )
+                    )
+
+                # Use the full wav buffer returned by the SDK — trimming to
+                # the reported `duration` clipped consonant decay in v2's
+                # legacy path; the v3 SDK does not need it.
+                duration_val = float(duration[0]) if hasattr(duration, '__len__') else float(duration)
+                wav_2d = np.atleast_2d(wav)
+                wav_full = wav_2d[0]
+
+                # Apply volume boost and clip to prevent distortion
+                wav_boosted = np.clip(wav_full * float(volume), -1.0, 1.0)
+
+                # Convert to int16 for Wyoming
+                wav_int16 = (wav_boosted * 32767).astype(np.int16)
+
+                _LOGGER.debug("Sentence %d/%d: duration=%.2fs, samples=%d — streaming now",
+                              idx + 1, len(sentences), duration_val, len(wav_int16))
+
+                # Stream audio chunks immediately (don't wait for remaining sentences)
+                chunk_size = 1024
+                for i in range(0, len(wav_int16), chunk_size):
+                    chunk_bytes = wav_int16[i:i + chunk_size].tobytes()
+                    await self.write_event(
+                        AudioChunk(
+                            rate=self.tts.sample_rate,
+                            width=2,   # 16-bit
+                            channels=1,  # mono
+                            audio=chunk_bytes,
+                        ).event()
+                    )
+
+            except Exception as e:
+                # Don't abort the whole announcement on a single bad sentence:
+                # keep streaming what we have so the user at least hears the rest.
+                _LOGGER.error("TTS synthesis failed on sentence %d/%d (continuing): %s",
+                              idx + 1, len(sentences), e, exc_info=True)
+                continue
+
+        # Pad with 500ms of trailing silence before AudioStop. Many media
+        # players truncate playback on AudioStop while their audio queue is
+        # still draining, which clips the last 100–500ms of the final phrase.
+        # The variability comes from the player's queue state, not from our
+        # buffer — we always stream the full wav. The silence gives the player
+        # a "decoy" tail to consume so the actual speech finishes before any
+        # truncation.
+        _TAIL_PAD_S = 0.5
+        tail_pad = np.zeros(int(self.tts.sample_rate * _TAIL_PAD_S), dtype=np.int16)
+        for i in range(0, len(tail_pad), 1024):
+            await self.write_event(
+                AudioChunk(
+                    rate=self.tts.sample_rate,
+                    width=2,
+                    channels=1,
+                    audio=tail_pad[i:i + 1024].tobytes(),
+                ).event()
+            )
+
+        # Signal completion after all sentences
+        await self.write_event(AudioStop().event())
+
+
+
+async def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description="Supertonic3 TTS Wyoming Server")
+    parser.add_argument(
+        "--uri",
+        default="tcp://0.0.0.0:10300",
+        help="URI to bind server (e.g. tcp://0.0.0.0:10300)",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default="/data",
+        help="Data directory for configuration",
+    )
+    parser.add_argument(
+        "--models-dir",
+        default="/opt/supertonic-models",
+        help="Directory containing Supertonic-3 ONNX models and voice styles",
+    )
+    parser.add_argument(
+        "--zeroconf",
+        action="store_true",
+        help="Enable Zeroconf/mDNS discovery for Home Assistant",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+
+    args = parser.parse_args()
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    _LOGGER.info("=== Supertonic3 TTS Wyoming Server Starting ===")
+
+    # Load configuration
+    config = {}
+    options_file = Path(args.data_dir) / "options.json"
+    if options_file.exists():
+        import json
+        with open(options_file, 'r') as f:
+            config = json.load(f)
+        _LOGGER.info("Loaded configuration: %s", config)
+    else:
+        # Default configuration
+        config = {
+            "default_language": "fr",
+            "default_voice": "M4",
+            "speed": 1.5,
+            "volume_boost": 2.0,
+            "quality": 5
+        }
+        _LOGGER.info("Using default configuration")
+
+    # Initialize TTS engine via Supertonic SDK.
+    # We pass model_dir explicitly because the SDK's get_model_cache_dir() ignores
+    # SUPERTONIC_CACHE_DIR; the addon image pre-downloads models to /opt/supertonic-models.
+    _LOGGER.info("Loading Supertonic-3 TTS engine from %s", args.models_dir)
+    tts = TTS(
+        model="supertonic-3",
+        model_dir=args.models_dir,
+        auto_download=False,
+    )
+    _LOGGER.info("TTS engine loaded (sample rate: %d Hz)", tts.sample_rate)
+
+    # Pre-load all voice styles
+    voice_styles = {}
+    _LOGGER.info("Loading voice styles")
+    for voice_id in SUPPORTED_VOICES:
+        try:
+            voice_styles[voice_id] = tts.get_voice_style(voice_name=voice_id)
+            _LOGGER.info("  ✓ Loaded voice: %s", voice_id)
+        except Exception as e:
+            _LOGGER.warning("  ✗ Failed to load voice %s: %s", voice_id, e)
+
+    _LOGGER.info("Loaded %d voice styles", len(voice_styles))
+
+    # Create Wyoming Info with all voices for all languages
+    voices = []
+    for lang_code, lang_name in SUPPORTED_LANGUAGES.items():
+        for voice_id, voice_desc in SUPPORTED_VOICES.items():
+            voices.append(
+                TtsVoice(
+                    name=f"{lang_code}_{voice_id}",
+                    description=f"{lang_name} - {voice_desc}",
+                    attribution=Attribution(
+                        name="Supertone Inc.",
+                        url="https://github.com/supertone-inc/supertonic",
+                    ),
+                    installed=True,
+                    version="3.0.0",
+                    languages=[lang_code],
+                )
+            )
+
+    _LOGGER.info(
+        "Advertising %d voices across %d languages",
+        len(voices),
+        len(SUPPORTED_LANGUAGES),
+    )
+
+    wyoming_info = Info(
+        tts=[
+            TtsProgram(
+                name="supertonic3",
+                description="Supertonic3 - Ultra-fast, on-device multilingual TTS",
+                attribution=Attribution(
+                    name="Supertone Inc.",
+                    url="https://github.com/supertone-inc/supertonic",
+                ),
+                installed=True,
+                version="3.0.0",
+                voices=voices,
+            )
+        ],
+    )
+
+    # Start Wyoming server
+    _LOGGER.info("=" * 60)
+    _LOGGER.info("Starting Wyoming server on %s", args.uri)
+
+    # Get hostname for discovery info
+    import socket
+    hostname = socket.gethostname()
+    _LOGGER.info("Hostname: %s", hostname)
+
+    # Create server
+    server = AsyncServer.from_uri(args.uri)
+    _LOGGER.info("Server instance created: %s", type(server).__name__)
+
+    _LOGGER.info("=" * 60)
+    _LOGGER.info("Wyoming server ready. Starting event loop...")
+    _LOGGER.info("Server URI: %s", args.uri)
+
+    # Variables for Zeroconf
+    aiozc = None
+    service_info = None
+
+    try:
+        _LOGGER.info("Starting Wyoming server (this will block)...")
+        _LOGGER.info("Server will listen on all interfaces (0.0.0.0:10300)")
+
+        # Start server in a way that allows us to also run Zeroconf
+        # We need to start Zeroconf AFTER the server starts listening
+
+        # Shared lock to serialize ONNX synthesis across concurrent Wyoming clients
+        synth_lock = asyncio.Lock()
+
+        # Create the event handler factory
+        handler_factory = partial(
+            SupertonicEventHandler,
+            wyoming_info,
+            args,
+            tts,
+            voice_styles,
+            config,
+            synth_lock,
+        )
+
+        # Start Zeroconf registration if requested
+        if args.zeroconf:
+            try:
+                from zeroconf import ServiceInfo
+                from zeroconf.asyncio import AsyncZeroconf
+                import socket as sock
+
+                port = 10300
+                _LOGGER.info("Enabling Zeroconf/mDNS discovery for Home Assistant")
+
+                # Get local IP address
+                try:
+                    s = sock.socket(sock.AF_INET, sock.SOCK_DGRAM)
+                    s.connect(("8.8.8.8", 80))
+                    local_ip = s.getsockname()[0]
+                    s.close()
+                    local_ip_bytes = sock.inet_aton(local_ip)
+                except Exception:
+                    local_ip = "0.0.0.0"
+                    local_ip_bytes = sock.inet_aton(local_ip)
+
+                service_name = "Supertonic3 TTS._wyoming._tcp.local."
+                service_type = "_wyoming._tcp.local."
+
+                service_info = ServiceInfo(
+                    service_type,
+                    service_name,
+                    addresses=[local_ip_bytes],
+                    port=port,
+                    properties={
+                        "name": "Supertonic3 TTS",
+                        "program": "supertonic3",
+                        "domain": "tts",
+                    },
+                    server=f"{hostname}.local.",
+                )
+
+                aiozc = AsyncZeroconf()
+                await aiozc.async_register_service(service_info)
+
+                _LOGGER.info("Wyoming service registered on mDNS:")
+                _LOGGER.info("  - Service: %s", service_type)
+                _LOGGER.info("  - Name: Supertonic3 TTS")
+                _LOGGER.info("  - Host: %s (%s.local)", local_ip, hostname)
+                _LOGGER.info("  - Port: %d", port)
+                _LOGGER.info("Zeroconf/mDNS: ENABLED ✓")
+            except Exception as e:
+                _LOGGER.error("Zeroconf setup failed: %s", e, exc_info=True)
+
+        _LOGGER.info("=" * 60)
+        _LOGGER.info("Calling server.run() - server should now be listening...")
+
+        # Start the server - this blocks until shutdown
+        await server.run(handler_factory)
+
+        _LOGGER.info("Server exited normally")
+    except Exception as e:
+        _LOGGER.error("Server failed: %s", e, exc_info=True)
+        raise
+    finally:
+        # Clean shutdown of Zeroconf
+        if aiozc is not None and service_info is not None:
+            _LOGGER.info("Stopping Zeroconf service...")
+            try:
+                await aiozc.async_unregister_service(service_info)
+                await aiozc.async_close()
+                _LOGGER.info("Zeroconf service stopped")
+            except Exception as e:
+                _LOGGER.warning("Error stopping Zeroconf: %s", e)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        _LOGGER.info("Server stopped by user")
+    except Exception as e:
+        _LOGGER.error("Server error: %s", e, exc_info=True)
+        sys.exit(1)

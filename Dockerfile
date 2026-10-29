@@ -32,10 +32,14 @@ RUN python3 -c "from supertonic import TTS; TTS(model='supertonic-3', auto_downl
     mv "$SRC" /opt/supertonic-models && \
     ls -la /opt/supertonic-models/onnx /opt/supertonic-models/voice_styles
 
-# Wyoming server straight from the add-on repo (pinned branch).
+# Wyoming server vendored from the add-on repo (supertonic_server.py @ 1b5d612a,
+# 2026-05-14, "fix: supertonic3 predictor under allocation") so builds are
+# reproducible - we only added one startup log line advertising voice/language
+# counts. One-line diff from upstream, see git history.
 # Note: upstream's run() script passes --zeroconf; we skip it because mDNS
 # across docker bridge networks is unreliable - add the integration manually by IP:port.
-ADD https://raw.githubusercontent.com/JulienDeveaux/HA-Supertonic-Addon/main/supertonic_tts/rootfs/usr/bin/supertonic_server.py /opt/supertonic_server.py
+COPY supertonic_server.py /opt/supertonic_server.py
+COPY describe_probe.py /opt/describe_probe.py
 COPY gpu_entry.py /opt/gpu_entry.py
 
 EXPOSE 10300
