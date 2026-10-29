@@ -1,79 +1,74 @@
 #!/usr/bin/env python3
 """
-Raw Wyoming-protocol probe: asks the server what it actually advertises.
+Wyoming Describe probe: prints what the server actually advertises on the wire.
 
-Prints the voice count, the union of per-voice language codes, and one raw
-voice JSON object (so you can see the exact field names on the wire). This is
-what Home Assistant's Wyoming integration receives on its `Describe` handshake,
-so it settles any "HA only shows English" dispute:
+Uses the container's own `wyoming` library (same AsyncTcpClient + Describe +
+Info.from_event sequence that Home Assistant's Wyoming integration runs), so
+the framing/version skew risk of a hand-rolled protocol client is zero.
 
   docker exec supertonic3 python3 /opt/describe_probe.py
 
-Exit code 0 always (informational), non-zero only on connection failure.
+Prints voice count, the union of per-voice language codes, and one raw voice
+object as serialized JSON - i.e. exactly the data HA turns into its
+`supported_languages` attribute.
 """
 
+import asyncio
 import json
-import socket
-import struct
 import sys
 
-URI = sys.argv[1] if len(sys.argv) > 1 else "tcp://127.0.0.1:10300"
 
+async def main() -> int:
+    from wyoming.client import AsyncTcpClient
+    from wyoming.info import Describe, Info
 
-def main() -> int:
-    host, _, port = URI.removeprefix("tcp://").partition(":")
-    sock = socket.create_connection((host, int(port or 10300)), timeout=10)
+    try:
+        from wyoming.version import __version__ as wyoming_version
+    except ImportError:
+        wyoming_version = "?"
 
-    def send(event: dict) -> None:
-        body = json.dumps(event).encode()
-        sock.sendall(struct.pack(">I", len(body)) + body)
+    host, port = "127.0.0.1", 10300
+    if len(sys.argv) > 1 and sys.argv[1].startswith("tcp://"):
+        host, _, p = sys.argv[1][len("tcp://"):].partition(":")
+        port = int(p or 10300)
 
-    def recv() -> dict:
-        (size,) = struct.unpack(">I", recv_exact(4))
-        return json.loads(recv_exact(size))
+    client = AsyncTcpClient(host, port)
+    await client.connect()
+    try:
+        await client.write_event(Describe().event())
+        event = await client.read_event()
+    finally:
+        await client.disconnect()
 
-    def recv_exact(n: int) -> bytes:
-        buf = b""
-        while len(buf) < n:
-            chunk = sock.recv(n - len(buf))
-            if not chunk:
-                raise EOFError("connection closed mid-frame")
-            buf += chunk
-        return buf
+    if event is None:
+        print("connection closed before a reply")
+        return 1
+    if not Info.is_type(event.type):
+        print(f"expected an 'info' event, got '{event.type}'")
+        return 1
 
-    # wyoming.event.Event wire format: 4-byte big-endian length + JSON
-    send(
-        {
-            "type": "describe",
-            "data": [],
-            "id": "",
-            "created_at": "2026-01-01T00:00:00+00:00",
-            "origin": "",
-        }
-    )
-    info = recv()
-
-    programs = info.get("tts", [])
-    if not programs:
+    info = Info.from_event(event)
+    if not info.tts:
         print("server sent no tts program in Info event!")
-        print(json.dumps(info, indent=2)[:2000])
-        return 0
+        return 1
 
-    program = programs[0]
-    voices = program.get("voices", [])
-    langs = sorted({code for v in voices for code in v.get("languages", [])})
+    program = info.tts[0]
+    voices = [v for v in program.voices if v.installed]
+    langs = sorted({code for v in voices for code in v.languages})
 
-    print(f"program : {program.get('name')} v{program.get('version')}")
-    print(f"voices  : {len(voices)}")
-    print(f"langs   : {len(langs)} -> {', '.join(langs)}")
+    print(f"wyoming lib : {wyoming_version}")
+    print(f"program     : {program.name} v{program.version}")
+    print(f"voices      : {len(voices)} installed (of {len(program.voices)} advertised)")
+    print(f"langs       : {len(langs)} -> {', '.join(langs)}")
 
-    missing = [v.get("name") for v in voices if not v.get("languages")]
+    missing = [v.name for v in voices if not v.languages]
     if missing:
-        print(f"WARNING : {len(missing)} voices carry NO languages field, e.g. {missing[:5]}")
+        print(f"WARNING     : {len(missing)} voices carry NO languages field, e.g. {missing[:5]}")
 
-    print("sample  :", json.dumps(voices[0]) if voices else "(none)")
+    if voices:
+        print("sample      :", json.dumps(voices[0].to_dict()))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(asyncio.run(main()))
