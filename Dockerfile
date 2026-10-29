@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
       'wyoming>=1.5.0' \
       'zeroconf>=0.132.0' && \
     pip uninstall -y onnxruntime && \
-    pip install --no-cache-dir 'onnxruntime-gpu==1.20.1'
+    pip install --no-cache-dir 'onnxruntime-gpu==1.20.2'
 
 # Bake Supertonic-3 weights into the image (~385 MB), same relocation trick
 # the add-on uses: SDK downloads to its cache dir, we move it to a stable path.

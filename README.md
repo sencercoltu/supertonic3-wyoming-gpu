@@ -45,7 +45,7 @@ docker logs -f supertonic
 Healthy startup looks like:
 
 ```
-[gpu-entry] onnxruntime 1.20.1, available providers: ['CUDAExecutionProvider', 'CPUExecutionProvider', ...]
+[gpu-entry] onnxruntime 1.20.2, available providers: ['CUDAExecutionProvider', 'CPUExecutionProvider', ...]
 [gpu-entry] CUDA requested for all 4 ONNX sessions (CPU fallback kept)
 ...
 Using ONNX providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
